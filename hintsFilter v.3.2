@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""
+COMPLETE PIPELINE WITH GUI - CROSS-PLATFORM VERSION
+- Filters genes by hints (RNA‑seq / proteins)
+- Generates filtered GFF3, EggNOG, and InterProScan files with only confident genes
+- Supports quality filters (protein length, exon count, BRAKER score in ab initio mode)
+- Ab initio mode (no hints) available
+- Integrated analysis of the filtered GFF (gene statistics, pseudogene prediction, etc.)
+- INCLUDES TRANSCRIPT COUNT ANALYSIS
+- Tkinter GUI with soft green tones
+- Cross-platform: Windows, Linux, macOS compatible
+
+ROBUST STRATEGY:
+- Uses INTERSECTION (AND) of hints and quality filters to ensure maximum confidence.
+- Protein length is computed from the longest CDS per gene.
+- Genes without hints and with questionable protein length are automatically excluded.
+- UTF-8 encoding for all file operations to avoid charmap errors
+"""
+
+import os
+import sys
+import csv
+import re
+import argparse
+import threading
+import platform
+from datetime import datetime
+from collections import defaultdict
+
+import pandas as pd
+import numpy as np
+
+# --- Tkinter imports ---
+import tkinter as tk
+from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import ttk
+
+# ============================================================================
+# CROSS-PLATFORM UTILITIES
+# ============================================================================
+
+def get_platform_info():
+    """Return platform information for debugging."""
+    return {
+        'system': platform.system(),
+        'release': platform.release(),
+        'version': platform.version(),
+        'python_version': platform.python_version()
+    }
+
+def safe_open_file(filename, mode='r', encoding='utf-8', errors='replace'):
+    """
+    Safely open a file with proper encoding handling for cross-platform compatibility.
+    """
+    try:
+        return open(filename, mode, encoding=encoding, errors=errors)
+    except UnicodeDecodeError:
+        # If UTF-8 fails, try system default encoding
+        try:
+            return open(filename, mode, encoding=sys.getfilesystemencoding(), errors=errors)
+        except:
+            # Last resort: use binary mode for reading
+            if 'r' in mode:
+                return open(filename, mode, encoding='latin-1', errors=errors)
+            else:
+                raise
+
+def safe_write_text(filename, content, mode='w', encoding='utf-8'):
+    """Safely write text content to a file with proper encoding."""
+    try:
+        with open(filename, mode, encoding=encoding) as f:
+            f.write(content)
+    except UnicodeEncodeError:
+        # Fallback: replace problematic characters
+        with open(filename, mode, encoding=encoding, errors='replace') as f:
+            f.write(content)
+    except Exception as e:
+        # Ultimate fallback: try system encoding
+        try:
+            with open(filename, mode, encoding=sys.getfilesystemencoding(), errors='replace') as f:
+                f.write(content)
+        except:
+            # Last resort: write without encoding (binary mode)
+            with open(filename, mode + 'b') as f:
+                f.write(content.encode('utf-8', errors='replace'))
+
+def normalize_text(text):
+    """Normalize text to avoid encoding issues."""
+    if isinstance(text, str):
+        # Replace problematic Unicode characters with ASCII equivalents
+        replacements = {
+            '\u2011': '-',  # Non-breaking hyphen
+            '\u2012': '-',  # Figure dash
+            '\u2013': '-',  # En dash
+            '\u2014': '-',  # Em dash
+            '\u2015': '-',  # Horizontal bar
+            '\u2018': "'",  # Left single quotation mark
+            '\u2019': "'",  # Right single quotation mark
+            '\u201C': '"',  # Left double quotation mark
+            '\u201D': '"',  # Right double quotation mark
+            '\u2022': '*',  # Bullet
+            '\u00A0': ' ',  # Non-breaking space
+        }
+        for unicode_char, ascii_char in replacements.items():
+            text = text.replace(unicode_char, ascii_char)
+    return text
+
+def get_file_encoding(filename):
+    """Detect file encoding for cross-platform compatibility."""
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
+    
+    for encoding in encodings:
+        try:
+            with open(filename, 'r', encoding=encoding) as f:
+                f.read()
+            return encoding
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    
+    # Default to system encoding
+    return sys.getfilesystemencoding()
+
+# ============================================================================
+# PIPELINE CORE (MAIN LOGIC) - IMPROVED VERSION
+# ============================================================================
+
+class GFFBasedFilter:
+    def __init__(self, gff_file, hints_file, eggnog_file, interpro_file, output_dir,
+                 min_score=0.3, margin=500, min_protein_len=50, min_exons=1,
+                 min_braker_score=0.0, use_abinitio=False, run_analysis=True,
+                 callback_log=None):
+
+        self.gff_file = gff_file
+        self.hints_file = hints_file
+        self.eggnog_file = eggnog_file
+        self.interpro_file = interpro_file
+        self.output_dir = output_dir
+
+        self.min_score = min_score
+        self.margin = margin
+        self.min_protein_len = min_protein_len
+        self.min_exons = min_exons
+        # In non‑abinitio mode the score filter is ignored (forced to 0)
+        self.min_braker_score = min_braker_score if use_abinitio else 0.0
+        self.use_abinitio = use_abinitio
+        self.run_analysis = run_analysis
+        self.callback_log = callback_log
+
+        self.genes_with_hints = set()
+        self.genes_quality_pass = set()
+        self.genes_confident = set()
+        self.genes_without_hints = set()
+        self.transcript_to_gene = {}
+        self.gene_data = {}
+        self.hints_index = defaultdict(list)
+
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Log platform info
+        platform_info = get_platform_info()
+        self.log(f"\n🖥️ Platform: {platform_info['system']} {platform_info['release']}")
+        self.log(f"🐍 Python: {platform_info['python_version']}")
+
+    def log(self, msg):
+        """Send message to the log (GUI or console) with proper encoding."""
+        # Normalize the message to avoid encoding issues
+        msg = normalize_text(msg)
+        if self.callback_log:
+            try:
+                self.callback_log(msg)
+            except:
+                # If callback fails, print to console
+                print(msg)
+        else:
+            print(msg)
+
+    # ================================================================
+    # HINTS INDEXING
+    # ================================================================
+
+    def load_hints_index(self):
+        if self.use_abinitio or not os.path.exists(self.hints_file):
+            self.log("\n⚠️ Ab initio mode enabled or hints file not found. Skipping indexation.")
+            return True
+
+        self.log("\n📂 Indexing hints...")
+        columns = ['seqname', 'source', 'feature', 'start', 'end',
+                   'score', 'strand', 'phase', 'attribute']
+
+        try:
+            # Detect file encoding first
+            encoding = get_file_encoding(self.hints_file)
+            self.log(f"  🔍 Detected encoding: {encoding}")
+            
+            df = pd.read_csv(self.hints_file, sep='\t', comment='#',
+                             header=None, names=columns, dtype=str,
+                             encoding=encoding)
+            self.log(f"  ✅ {len(df):,} hints loaded")
+        except Exception as e:
+            self.log(f"  ❌ Error: {e}")
+            return False
+
+        for col in ['start', 'end', 'score']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        for idx, row in df.iterrows():
+            if pd.isna(row['start']) or pd.isna(row['end']):
+                continue
+            chr_name = str(row['seqname'])
+            start = int(row['start'])
+            end = int(row['end'])
+            self.hints_index[chr_name].append({
+                'start': start,
+                'end': end,
+                'feature': str(row['feature']),
+                'score': float(row['score']) if not pd.isna(row['score']) else 0,
+                'source': str(row['source'])
+            })
+
+        for chr_name in self.hints_index:
+            self.hints_index[chr_name].sort(key=lambda x: x['start'])
+
+        self.log(f"  ✅ {len(self.hints_index)} chromosomes indexed")
+        return True
+
+    # ================================================================
+    # ID AND ATTRIBUTE PARSING FROM GFF
+    # ================================================================
+
+    def parse_attributes(self, attr_string):
+        attrs = {}
+        if pd.isna(attr_string):
+            return attrs
+        attr_string = str(attr_string)
+        # Normalize to avoid encoding issues
+        attr_string = normalize_text(attr_string)
+        for item in attr_string.split(';'):
+            item = item.strip()
+            if not item:
+                continue
+            if '=' in item:
+                parts = item.split('=', 1)
+                if len(parts) == 2:
+                    attrs[parts[0].strip()] = parts[1].strip('"')
+            elif ' ' in item:
+                parts = item.split(' ', 1)
+                if len(parts) == 2:
+                    attrs[parts[0].strip()] = parts[1].strip('"')
+        return attrs
+
+    def extract_ids_from_gff(self):
+        self.log("\n🔍 Extracting IDs from GFF...")
+        columns = ['seqname', 'source', 'feature', 'start', 'end',
+                   'score', 'strand', 'phase', 'attribute']
+
+        try:
+            # Detect file encoding
+            encoding = get_file_encoding(self.gff_file)
+            self.log(f"  🔍 Detected encoding: {encoding}")
+            
+            df = pd.read_csv(self.gff_file, sep='\t', comment='#',
+                             header=None, names=columns, dtype=str,
+                             encoding=encoding)
+            self.log(f"  ✅ {len(df):,} lines loaded")
+        except Exception as e:
+            self.log(f"  ❌ Error: {e}")
+            return False
+
+        for col in ['start', 'end']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        gene_info = {}
+        transcript_exon_count = defaultdict(int)
+        transcript_cds_length = defaultdict(int)
+
+        # First pass: count exons per transcript and collect CDS lengths
+        for idx, row in df.iterrows():
+            feature = str(row['feature'])
+            attrs = self.parse_attributes(row['attribute'])
+
+            if feature == 'exon':
+                parent = attrs.get('Parent') or attrs.get('parent')
+                if parent:
+                    transcript_exon_count[parent] += 1
+
+            elif feature in ['CDS', 'cDNA_match']:
+                parent = attrs.get('Parent') or attrs.get('parent')
+                if parent:
+                    start = int(row['start'])
+                    end = int(row['end'])
+                    length = abs(end - start) + 1
+                    transcript_cds_length[parent] += length
+
+        # Second pass: map genes and transcripts
+        for idx, row in df.iterrows():
+            feature = str(row['feature'])
+            attrs = self.parse_attributes(row['attribute'])
+
+            if feature == 'gene':
+                gene_id = attrs.get('ID') or attrs.get('gene_id')
+                if gene_id:
+                    # Normalize gene ID
+                    gene_id = normalize_text(gene_id)
+                    braker_score = float(row['score']) if row['score'] != '.' else 0.0
+                    gene_info[gene_id] = {
+                        'chr': normalize_text(str(row['seqname'])),
+                        'start': int(row['start']),
+                        'end': int(row['end']),
+                        'strand': normalize_text(str(row['strand'])),
+                        'attributes': normalize_text(str(row['attribute'])),
+                        'transcripts': set(),
+                        'braker_score': braker_score,
+                        'exon_count': 0,
+                        'protein_len': 0
+                    }
+
+            elif feature in ['mRNA', 'transcript']:
+                transcript_id = attrs.get('ID') or attrs.get('transcript_id')
+                gene_id = attrs.get('Parent') or attrs.get('parent') or attrs.get('gene_id')
+                if transcript_id and gene_id and gene_id in gene_info:
+                    transcript_id = normalize_text(transcript_id)
+                    gene_info[gene_id]['transcripts'].add(transcript_id)
+                    self.transcript_to_gene[transcript_id] = gene_id
+                    gene_info[gene_id]['exon_count'] = max(
+                        gene_info[gene_id]['exon_count'],
+                        transcript_exon_count.get(transcript_id, 0)
+                    )
+                    # Calculate protein length from CDS of this transcript
+                    cds_len = transcript_cds_length.get(transcript_id, 0)
+                    prot_len = cds_len // 3
+                    gene_info[gene_id]['protein_len'] = max(
+                        gene_info[gene_id]['protein_len'],
+                        prot_len
+                    )
+
+        # Fallback to GTF format if no genes found in GFF3
+        if not gene_info:
+            self.log("  ⚠️ No genes found in GFF3 format. Trying GTF...")
+            for idx, row in df.iterrows():
+                feature = str(row['feature'])
+                attrs = self.parse_attributes(row['attribute'])
+                if feature == 'gene':
+                    gene_id = attrs.get('gene_id')
+                    if gene_id:
+                        gene_id = normalize_text(gene_id)
+                        gene_info[gene_id] = {
+                            'chr': normalize_text(str(row['seqname'])),
+                            'start': int(row['start']),
+                            'end': int(row['end']),
+                            'strand': normalize_text(str(row['strand'])),
+                            'attributes': normalize_text(str(row['attribute'])),
+                            'transcripts': set(),
+                            'braker_score': float(row['score']) if row['score'] != '.' else 0.0,
+                            'exon_count': 0,
+                            'protein_len': 0
+                        }
+                elif feature in ['mRNA', 'transcript']:
+                    transcript_id = attrs.get('transcript_id')
+                    gene_id = attrs.get('gene_id')
+                    if transcript_id and gene_id and gene_id in gene_info:
+                        transcript_id = normalize_text(transcript_id)
+                        gene_info[gene_id]['transcripts'].add(transcript_id)
+                        self.transcript_to_gene[transcript_id] = gene_id
+                        gene_info[gene_id]['exon_count'] = max(
+                            gene_info[gene_id]['exon_count'],
+                            transcript_exon_count.get(transcript_id, 0)
+                        )
+                        cds_len = transcript_cds_length.get(transcript_id, 0)
+                        prot_len = cds_len // 3
+                        gene_info[gene_id]['protein_len'] = max(
+                            gene_info[gene_id]['protein_len'],
+                            prot_len
+                        )
+
+        self.gene_data = gene_info
+        self.log(f"  ✅ {len(gene_info):,} genes identified")
+        self.log(f"  ✅ {len(self.transcript_to_gene):,} transcripts mapped")
+
+        # ===== DEBUG: statistics of extracted data =====
+        if gene_info:
+            protein_lens = [d['protein_len'] for d in gene_info.values()]
+            exon_counts = [d['exon_count'] for d in gene_info.values()]
+            braker_scores = [d['braker_score'] for d in gene_info.values()]
+            transcript_counts = [len(d['transcripts']) for d in gene_info.values()]
+
+            self.log(f"\n🔍 Extracted statistics:")
+            self.log(f"  protein_len: min={min(protein_lens)}, max={max(protein_lens)}, mean={sum(protein_lens)/len(protein_lens):.1f}")
+            self.log(f"  exon_count : min={min(exon_counts)}, max={max(exon_counts)}, mean={sum(exon_counts)/len(exon_counts):.1f}")
+            self.log(f"  braker_score: min={min(braker_scores):.3f}, max={max(braker_scores):.3f}, mean={sum(braker_scores)/len(braker_scores):.3f}")
+            self.log(f"  transcripts per gene: min={min(transcript_counts)}, max={max(transcript_counts)}, mean={sum(transcript_counts)/len(transcript_counts):.2f}")
+            self.log("  Example of first 5 genes:")
+            for i, (gid, data) in enumerate(list(gene_info.items())[:5]):
+                self.log(f"    {gid}: exons={data['exon_count']}, prot_len={data['protein_len']}, score={data['braker_score']}, transcripts={len(data['transcripts'])}")
+        # ===================================================
+
+        return True
+
+    # ================================================================
+    # CLASSIFICATION BY HINTS + QUALITY FILTERS (INTERSECTION)
+    # ================================================================
+
+    def classify_genes(self):
+        self.log("\n🔗 Classifying genes...")
+
+        genes_found = 0
+        genes_with_hints = 0
+        quality_pass_count = 0
+
+        for gene_id, data in self.gene_data.items():
+            genes_found += 1
+            chr_name = data['chr']
+            gene_start = data['start']
+            gene_end = data['end']
+
+            # --- Check for hints ---
+            hints_in_region = []
+            has_hint = False
+            if not self.use_abinitio and chr_name in self.hints_index:
+                for hint in self.hints_index[chr_name]:
+                    if hint['start'] <= gene_end + self.margin and hint['end'] >= gene_start - self.margin:
+                        if hint['score'] >= self.min_score:
+                            hints_in_region.append(hint)
+                if hints_in_region:
+                    has_hint = True
+                    genes_with_hints += 1
+
+            data['hints_count'] = len(hints_in_region)
+            data['hints'] = hints_in_region
+            data['has_hint'] = has_hint
+
+            # --- Quality filters (independent of hints) ---
+            protein_len = data.get('protein_len', 0)
+            exon_count = data.get('exon_count', 0)
+            braker_score = data.get('braker_score', 0.0)
+
+            pass_quality = True
+            if protein_len < self.min_protein_len:
+                pass_quality = False
+            if exon_count < self.min_exons:
+                pass_quality = False
+            # Apply BRAKER score filter only in ab initio mode
+            if self.use_abinitio and braker_score < self.min_braker_score:
+                pass_quality = False
+
+            if pass_quality:
+                self.genes_quality_pass.add(gene_id)
+                quality_pass_count += 1
+
+            if has_hint:
+                self.genes_with_hints.add(gene_id)
+            else:
+                self.genes_without_hints.add(gene_id)
+
+        # --- Final set of confident genes ---
+        if self.use_abinitio:
+            # In ab initio mode, only quality filters matter (no hints)
+            self.genes_confident = self.genes_quality_pass.copy()
+            self.log("\n📊 Ab initio mode: using only quality filters (including BRAKER score).")
+        else:
+            # ROBUST STRATEGY: INTERSECTION (genes must have hints AND pass quality)
+            self.genes_confident = self.genes_with_hints.intersection(self.genes_quality_pass)
+            self.log("\n📊 Robust mode: using INTERSECTION of hints and quality filters.")
+
+        self.log(f"\n  📊 Results:")
+        self.log(f"  Total genes: {genes_found:,}")
+        self.log(f"  Genes with hints: {len(self.genes_with_hints):,} ({len(self.genes_with_hints)/genes_found*100:.1f}%)")
+        self.log(f"  Genes passing quality: {len(self.genes_quality_pass):,} ({len(self.genes_quality_pass)/genes_found*100:.1f}%)")
+        self.log(f"  CONFIDENT genes (final): {len(self.genes_confident):,} ({len(self.genes_confident)/genes_found*100:.1f}%)")
+
+        return True
+
+    # ================================================================
+    # SAVE LISTS AND FILTERED GFF
+    # ================================================================
+
+    def save_gene_lists(self):
+        self.log("\n💾 Saving gene lists...")
+
+        confident_file = os.path.join(self.output_dir, 'genes_confident.txt')
+        with safe_open_file(confident_file, 'w') as f:
+            for gene in sorted(self.genes_confident):
+                f.write(normalize_text(gene) + '\n')
+        self.log(f"  ✅ {confident_file} ({len(self.genes_confident):,} genes)")
+
+        nohint_file = os.path.join(self.output_dir, 'genes_without_hints.txt')
+        with safe_open_file(nohint_file, 'w') as f:
+            for gene in sorted(self.genes_without_hints):
+                f.write(normalize_text(gene) + '\n')
+        self.log(f"  ✅ {nohint_file} ({len(self.genes_without_hints):,} genes)")
+
+        return confident_file, nohint_file
+
+    def filter_gff(self):
+        self.log("\n📄 Generating filtered GFF (only confident genes)...")
+        output_file = os.path.join(self.output_dir, 'braker_confident_only.gff3')
+
+        try:
+            # Detect encoding of input file
+            encoding = get_file_encoding(self.gff_file)
+            
+            with safe_open_file(self.gff_file, 'r', encoding=encoding) as infile, \
+                 safe_open_file(output_file, 'w') as outfile:
+                
+                for line in infile:
+                    if line.startswith('#'):
+                        outfile.write(line)
+                        continue
+
+                    fields = line.strip().split('\t')
+                    if len(fields) < 9:
+                        continue
+
+                    feature = fields[2]
+                    attrs_str = fields[8]
+                    attrs = self.parse_attributes(attrs_str)
+                    keep = False
+
+                    if feature == 'gene':
+                        gene_id = attrs.get('ID') or attrs.get('gene_id')
+                        if gene_id and gene_id in self.genes_confident:
+                            keep = True
+
+                    elif feature in ['mRNA', 'transcript']:
+                        gene_id = attrs.get('Parent') or attrs.get('parent') or attrs.get('gene_id')
+                        if gene_id and gene_id in self.genes_confident:
+                            keep = True
+                        if not keep:
+                            transcript_id = attrs.get('ID') or attrs.get('transcript_id')
+                            if transcript_id and transcript_id in self.transcript_to_gene:
+                                gene_id = self.transcript_to_gene[transcript_id]
+                                if gene_id in self.genes_confident:
+                                    keep = True
+
+                    else:
+                        parent = attrs.get('Parent') or attrs.get('parent')
+                        if parent:
+                            if parent in self.transcript_to_gene:
+                                gene_id = self.transcript_to_gene[parent]
+                                if gene_id in self.genes_confident:
+                                    keep = True
+                            elif parent in self.genes_confident:
+                                keep = True
+
+                    if keep:
+                        outfile.write(line)
+
+            self.log(f"  ✅ Filtered GFF: {output_file}")
+            return output_file
+        except Exception as e:
+            self.log(f"  ❌ Error filtering GFF: {e}")
+            return None
+
+    # ================================================================
+    # ROBUST ID MATCHING FOR FUNCTIONAL ANNOTATION
+    # ================================================================
+
+    def match_gene_id(self, protein_id):
+        if not protein_id:
+            return None
+        protein_id = normalize_text(protein_id.strip())
+
+        # Strategy 1: direct match
+        if protein_id in self.genes_confident:
+            return protein_id
+
+        # Strategy 2: remove suffix
+        if '.' in protein_id:
+            base = protein_id.split('.')[0]
+            if base in self.genes_confident:
+                return base
+
+        # Strategy 3: use transcript-to-gene mapping
+        if protein_id in self.transcript_to_gene:
+            gene_id = self.transcript_to_gene[protein_id]
+            if gene_id in self.genes_confident:
+                return gene_id
+
+        # Strategy 4: regex for common patterns (g1, gene123, maker-scaffold...)
+        match = re.search(r'(g\d+|gene\d+|maker-[^\s]+)', protein_id, re.IGNORECASE)
+        if match:
+            base = match.group(1)
+            if base in self.genes_confident:
+                return base
+
+        return None
+
+    def filter_eggnog(self):
+        self.log("\n🧬 Filtering EggNOG...")
+        if not os.path.exists(self.eggnog_file):
+            self.log(f"  ⚠️ File not found: {self.eggnog_file}")
+            return None
+
+        output_file = os.path.join(self.output_dir, 'eggnog_confident_only.emapper.annotations')
+        try:
+            # Detect encoding
+            encoding = get_file_encoding(self.eggnog_file)
+            
+            with safe_open_file(self.eggnog_file, 'r', encoding=encoding) as f:
+                lines = f.readlines()
+
+            header_lines = [l for l in lines if l.startswith('#')]
+            data_lines = [l for l in lines if not l.startswith('#') and l.strip()]
+
+            filtered = []
+            kept = 0
+            for line in data_lines:
+                fields = line.strip().split('\t')
+                if len(fields) < 2:
+                    continue
+                protein_id = normalize_text(fields[0].strip())
+                gene_id = self.match_gene_id(protein_id)
+                if gene_id:
+                    filtered.append(line)
+                    kept += 1
+
+            with safe_open_file(output_file, 'w') as f:
+                f.writelines(header_lines)
+                f.writelines(filtered)
+
+            total = len(data_lines)
+            self.log(f"  ✅ Total: {total:,} | Kept: {kept:,} ({kept/total*100:.1f}%)")
+            self.log(f"  ✅ File: {output_file}")
+            return output_file
+        except Exception as e:
+            self.log(f"  ❌ Error: {e}")
+            return None
+
+    def filter_interproscan(self):
+        self.log("\n💻 Filtering InterProScan...")
+        if not os.path.exists(self.interpro_file):
+            self.log(f"  ⚠️ File not found: {self.interpro_file}")
+            return None
+
+        output_file = os.path.join(self.output_dir, 'interpro_confident_only.tsv')
+        try:
+            # Detect encoding
+            encoding = get_file_encoding(self.interpro_file)
+            
+            total = 0
+            kept = 0
+            filtered_lines = []
+            with safe_open_file(self.interpro_file, 'r', encoding=encoding) as infile:
+                reader = csv.reader(infile, delimiter='\t', quoting=csv.QUOTE_NONE)
+                for row in reader:
+                    if not row or row[0].startswith('#'):
+                        continue
+                    total += 1
+                    protein_id = normalize_text(row[0].strip())
+                    gene_id = self.match_gene_id(protein_id)
+                    if gene_id:
+                        filtered_lines.append(row)
+                        kept += 1
+
+            with safe_open_file(output_file, 'w', newline='') as outfile:
+                writer = csv.writer(outfile, delimiter='\t')
+                writer.writerows(filtered_lines)
+
+            self.log(f"  ✅ Total: {total:,} | Kept: {kept:,} ({kept/total*100:.1f}%)")
+            self.log(f"  ✅ File: {output_file}")
+            return output_file
+        except Exception as e:
+            self.log(f"  ❌ Error: {e}")
+            return None
+
+    # ================================================================
+    # INTEGRATED GFF ANALYSIS - WITH TRANSCRIPT COUNT
+    # ================================================================
+
+    def analyze_filtered_gff(self, filtered_gff_path):
+        """Run statistical analysis on the filtered GFF file including transcript counting."""
+        if not self.run_analysis or not os.path.exists(filtered_gff_path):
+            return
+
+        self.log("\n📊 Running GFF analysis...")
+        try:
+            # We use a local class to avoid conflicts
+            class GFFAnalyzer:
+                def __init__(self):
+                    self.genes = defaultdict(dict)
+                    self.transcripts = defaultdict(set)  # gene_id -> set of transcript_ids
+                    self.chromosomes = set()
+                    self.total_genes = 0
+                    self.total_transcripts = 0
+                    self.genes_without_start = set()
+                    self.genes_without_stop = set()
+                    self.genes_without_both = set()
+                    self.single_exon_genes = set()
+                    self.multi_exon_genes = set()
+                    self.strand_distribution = defaultdict(int)
+                    self.gene_lengths = []
+                    self.transcripts_per_gene = []  # list of transcript counts per gene
+
+                def parse_attributes(self, attr_str):
+                    attrs = {}
+                    attr_str = normalize_text(str(attr_str))
+                    for item in attr_str.split(';'):
+                        if '=' in item:
+                            k, v = item.split('=', 1)
+                            attrs[normalize_text(k.strip())] = normalize_text(v.strip())
+                    return attrs
+
+                def parse_gff(self, filename):
+                    current_gene = None
+                    current_chromosome = None
+                    current_transcript = None
+                    # Detect encoding
+                    encoding = get_file_encoding(filename)
+                    
+                    with safe_open_file(filename, 'r', encoding=encoding) as f:
+                        for line in f:
+                            line = normalize_text(line.strip())
+                            if not line or line.startswith('#'):
+                                continue
+                            fields = line.split('\t')
+                            if len(fields) < 9:
+                                continue
+                            chrom, source, feature, start, end, score, strand, phase, attrs_str = fields
+                            start, end = int(start), int(end)
+                            attrs = self.parse_attributes(attrs_str)
+                            self.chromosomes.add(chrom)
+
+                            if feature == 'gene':
+                                gene_id = attrs.get('ID', '')
+                                if gene_id:
+                                    self.genes[chrom][gene_id] = {
+                                        'id': gene_id,
+                                        'chrom': chrom,
+                                        'start': start,
+                                        'end': end,
+                                        'strand': strand,
+                                        'has_start': False,
+                                        'has_stop': False,
+                                        'exon_count': 0,
+                                        'cds_count': 0,
+                                        'intron_count': 0,
+                                        'transcript_count': 0,
+                                        'transcripts': set()
+                                    }
+                                    current_gene = gene_id
+                                    current_chromosome = chrom
+                                    self.total_genes += 1
+                                    current_transcript = None
+
+                            elif feature in ['mRNA', 'transcript']:
+                                transcript_id = attrs.get('ID', '')
+                                if transcript_id and current_gene:
+                                    self.transcripts[current_gene].add(transcript_id)
+                                    if current_gene in self.genes[current_chromosome]:
+                                        self.genes[current_chromosome][current_gene]['transcripts'].add(transcript_id)
+                                        self.genes[current_chromosome][current_gene]['transcript_count'] += 1
+                                    current_transcript = transcript_id
+                                    self.total_transcripts += 1
+
+                            elif feature in ['CDS', 'exon', 'intron', 'start_codon', 'stop_codon']:
+                                if current_gene and current_chromosome:
+                                    gene_data = self.genes[current_chromosome].get(current_gene)
+                                    if gene_data:
+                                        if feature == 'CDS':
+                                            gene_data['cds_count'] += 1
+                                        elif feature == 'exon':
+                                            gene_data['exon_count'] += 1
+                                        elif feature == 'intron':
+                                            gene_data['intron_count'] += 1
+                                        elif feature == 'start_codon':
+                                            gene_data['has_start'] = True
+                                        elif feature == 'stop_codon':
+                                            gene_data['has_stop'] = True
+
+                def analyze(self):
+                    for chrom, genes_dict in self.genes.items():
+                        for gene_id, data in genes_dict.items():
+                            # Transcript count analysis
+                            transcript_count = data.get('transcript_count', 0)
+                            self.transcripts_per_gene.append(transcript_count)
+                            
+                            # Pseudogene analysis
+                            if not data['has_start'] and not data['has_stop']:
+                                self.genes_without_both.add(gene_id)
+                            elif not data['has_start']:
+                                self.genes_without_start.add(gene_id)
+                            elif not data['has_stop']:
+                                self.genes_without_stop.add(gene_id)
+
+                            # Exon analysis
+                            exon_count = data.get('exon_count', 0)
+                            if exon_count == 1:
+                                self.single_exon_genes.add(gene_id)
+                            elif exon_count > 1:
+                                self.multi_exon_genes.add(gene_id)
+
+                            # Strand distribution
+                            strand = data.get('strand', '')
+                            if strand:
+                                self.strand_distribution[strand] += 1
+
+                            # Gene length
+                            if 'start' in data and 'end' in data:
+                                self.gene_lengths.append(data['end'] - data['start'] + 1)
+
+                def generate_report(self):
+                    lines = []
+                    lines.append("=" * 80)
+                    lines.append("GENOME ANNOTATION REPORT (FILTERED SET)")
+                    lines.append("=" * 80)
+                    lines.append("")
+                    
+                    # 1. GENERAL SUMMARY
+                    lines.append("1. GENERAL SUMMARY")
+                    lines.append("-" * 40)
+                    lines.append(f"Total scaffolds/chromosomes: {len(self.chromosomes)}")
+                    lines.append(f"Total predicted genes: {self.total_genes}")
+                    lines.append(f"Total transcripts: {self.total_transcripts}")
+                    if self.total_genes > 0:
+                        avg_transcripts = self.total_transcripts / self.total_genes
+                        lines.append(f"Average transcripts per gene: {avg_transcripts:.2f}")
+                    lines.append("")
+                    
+                    # 2. TRANSCRIPT DISTRIBUTION
+                    lines.append("2. TRANSCRIPT DISTRIBUTION")
+                    lines.append("-" * 40)
+                    if self.transcripts_per_gene:
+                        transcript_counts = self.transcripts_per_gene
+                        lines.append(f"Minimum transcripts per gene: {min(transcript_counts)}")
+                        lines.append(f"Maximum transcripts per gene: {max(transcript_counts)}")
+                        lines.append(f"Mean transcripts per gene: {sum(transcript_counts)/len(transcript_counts):.2f}")
+                        
+                        # Distribution categories
+                        single_transcript = sum(1 for x in transcript_counts if x == 1)
+                        multi_transcript = sum(1 for x in transcript_counts if x > 1)
+                        high_transcript = sum(1 for x in transcript_counts if x >= 5)
+                        
+                        lines.append(f"Genes with single transcript: {single_transcript} ({single_transcript/len(transcript_counts)*100:.1f}%)")
+                        lines.append(f"Genes with multiple transcripts: {multi_transcript} ({multi_transcript/len(transcript_counts)*100:.1f}%)")
+                        lines.append(f"Genes with ≥5 transcripts: {high_transcript} ({high_transcript/len(transcript_counts)*100:.1f}%)")
+                        
+                        # Top genes with most transcripts
+                        if max(transcript_counts) > 1:
+                            top_genes = sorted(
+                                [(gene_id, data['transcript_count']) 
+                                 for chrom in self.genes.values() 
+                                 for gene_id, data in chrom.items()],
+                                key=lambda x: x[1],
+                                reverse=True
+                            )[:5]
+                            lines.append("\nTop genes with most transcripts:")
+                            for gene_id, count in top_genes:
+                                if count > 1:
+                                    lines.append(f"  {gene_id}: {count} transcripts")
+                    lines.append("")
+                    
+                    # 3. GENE DISTRIBUTION PER CHROMOSOME
+                    lines.append("3. GENE DISTRIBUTION PER CHROMOSOME")
+                    lines.append("-" * 40)
+                    for chrom in sorted(self.chromosomes):
+                        cnt = len(self.genes.get(chrom, {}))
+                        transcript_cnt = sum(
+                            data.get('transcript_count', 0) 
+                            for data in self.genes.get(chrom, {}).values()
+                        )
+                        lines.append(f"  {chrom}: {cnt} genes, {transcript_cnt} transcripts")
+                    lines.append("")
+                    
+                    # 4. POTENTIAL PSEUDOGENE ANALYSIS
+                    lines.append("4. POTENTIAL PSEUDOGENE ANALYSIS")
+                    lines.append("-" * 40)
+                    lines.append(f"Genes missing start codon: {len(self.genes_without_start)}")
+                    lines.append(f"Genes missing stop codon: {len(self.genes_without_stop)}")
+                    lines.append(f"Genes missing both: {len(self.genes_without_both)}")
+                    total_pseudo = len(self.genes_without_start | self.genes_without_stop)
+                    lines.append(f"Total potential pseudogenes: {total_pseudo}")
+                    if self.genes_without_start:
+                        lines.append(f"Examples (no start): {', '.join(list(self.genes_without_start)[:5])}")
+                    if self.genes_without_stop:
+                        lines.append(f"Examples (no stop): {', '.join(list(self.genes_without_stop)[:5])}")
+                    lines.append("")
+                    
+                    # 5. GENE STRUCTURE
+                    lines.append("5. GENE STRUCTURE")
+                    lines.append("-" * 40)
+                    lines.append(f"Single-exon genes: {len(self.single_exon_genes)} ({self._pct(len(self.single_exon_genes))})")
+                    lines.append(f"Multi-exon genes: {len(self.multi_exon_genes)} ({self._pct(len(self.multi_exon_genes))})")
+                    total_exons = sum(g.get('exon_count', 0) for genes_dict in self.genes.values() for g in genes_dict.values())
+                    avg_exons = total_exons / self.total_genes if self.total_genes else 0
+                    lines.append(f"Average exons per gene: {avg_exons:.2f}")
+                    total_cds = sum(g.get('cds_count', 0) for genes_dict in self.genes.values() for g in genes_dict.values())
+                    avg_cds = total_cds / self.total_genes if self.total_genes else 0
+                    lines.append(f"Average CDS per gene: {avg_cds:.2f}")
+                    lines.append("")
+                    
+                    # 6. STRAND DISTRIBUTION
+                    lines.append("6. STRAND DISTRIBUTION")
+                    lines.append("-" * 40)
+                    total_strand = sum(self.strand_distribution.values())
+                    for strand, cnt in sorted(self.strand_distribution.items()):
+                        lines.append(f"Strand {strand}: {cnt} ({cnt/total_strand*100:.1f}%)")
+                    lines.append("")
+                    
+                    # 7. GENE LENGTH STATISTICS
+                    if self.gene_lengths:
+                        lines.append("7. GENE LENGTH STATISTICS")
+                        lines.append("-" * 40)
+                        lines.append(f"Minimum gene length: {min(self.gene_lengths)} bp")
+                        lines.append(f"Maximum gene length: {max(self.gene_lengths)} bp")
+                        lines.append(f"Average gene length: {sum(self.gene_lengths)/len(self.gene_lengths):.1f} bp")
+                        lines.append(f"Median gene length: {sorted(self.gene_lengths)[len(self.gene_lengths)//2]} bp")
+                        lines.append("")
+                    
+                    lines.append("=" * 80)
+                    lines.append("END OF REPORT")
+                    lines.append("=" * 80)
+                    return "\n".join(lines)
+
+                def _pct(self, value):
+                    return f"{value/self.total_genes*100:.1f}%" if self.total_genes else "0.0%"
+
+                def save_csv(self, filename):
+                    with safe_open_file(filename, 'w') as f:
+                        f.write("Gene_ID\tChromosome\tStart\tEnd\tStrand\tExons\tCDS\tTranscripts\tHas_Start\tHas_Stop\tLength\n")
+                        for chrom, genes_dict in self.genes.items():
+                            for gene_id, data in genes_dict.items():
+                                f.write(f"{gene_id}\t{chrom}\t{data['start']}\t{data['end']}\t")
+                                f.write(f"{data['strand']}\t{data['exon_count']}\t{data['cds_count']}\t")
+                                f.write(f"{data['transcript_count']}\t")
+                                f.write(f"{data['has_start']}\t{data['has_stop']}\t")
+                                f.write(f"{data['end'] - data['start'] + 1}\n")
+
+            # Run analysis
+            analyzer = GFFAnalyzer()
+            analyzer.parse_gff(filtered_gff_path)
+            analyzer.analyze()
+
+            # Save outputs with proper encoding
+            report_text = analyzer.generate_report()
+            report_text = normalize_text(report_text)
+            report_file = os.path.join(self.output_dir, 'filtered_gff_analysis_report.txt')
+            safe_write_text(report_file, report_text)
+            self.log(f"  ✅ Analysis report: {report_file}")
+
+            csv_file = os.path.join(self.output_dir, 'filtered_gene_details.csv')
+            analyzer.save_csv(csv_file)
+            self.log(f"  ✅ Gene details CSV: {csv_file}")
+
+            # Also print summary to log (with proper encoding)
+            summary_lines = report_text.split('\n')[:20]  # First 20 lines
+            summary = "\n".join(summary_lines) + "\n...\n[Full report saved in file]"
+            self.log("\n" + summary)
+
+        except Exception as e:
+            self.log(f"  ❌ Error during analysis: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+    # ================================================================
+    # FINAL REPORT
+    # ================================================================
+
+    def generate_report(self):
+        self.log("\n📊 Generating final report...")
+        report_file = os.path.join(self.output_dir, 'pipeline_report.txt')
+
+        report_lines = []
+        report_lines.append("=" * 80)
+        report_lines.append("PIPELINE FILTERING REPORT")
+        report_lines.append("=" * 80)
+        report_lines.append("")
+        report_lines.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(f"Platform: {platform.system()} {platform.release()}")
+        report_lines.append(f"Python: {platform.python_version()}")
+        report_lines.append("")
+        report_lines.append("INPUT FILES:")
+        report_lines.append(f"  GFF: {self.gff_file}")
+        report_lines.append(f"  Hints: {self.hints_file}")
+        report_lines.append(f"  EggNOG: {self.eggnog_file}")
+        report_lines.append(f"  InterProScan: {self.interpro_file}")
+        report_lines.append("")
+
+        total = len(self.gene_data)
+        report_lines.append("GENE CLASSIFICATION:")
+        report_lines.append(f"  Total genes: {total:,}")
+        report_lines.append(f"  Genes with hints: {len(self.genes_with_hints):,} ({len(self.genes_with_hints)/total*100:.1f}%)")
+        report_lines.append(f"  Genes passing quality: {len(self.genes_quality_pass):,} ({len(self.genes_quality_pass)/total*100:.1f}%)")
+        report_lines.append(f"  CONFIDENT genes (intersection): {len(self.genes_confident):,} ({len(self.genes_confident)/total*100:.1f}%)")
+        report_lines.append("")
+
+        report_lines.append("PARAMETERS:")
+        report_lines.append(f"  Minimum hints score: {self.min_score}")
+        report_lines.append(f"  Margin (bp): {self.margin}")
+        report_lines.append(f"  Minimum protein length: {self.min_protein_len} aa")
+        report_lines.append(f"  Minimum exon count: {self.min_exons}")
+        report_lines.append(f"  Minimum BRAKER score: {self.min_braker_score} (only in ab initio mode)")
+        report_lines.append(f"  Ab initio mode: {self.use_abinitio}")
+        report_lines.append(f"  Run GFF analysis: {self.run_analysis}")
+        report_lines.append(f"  Filtering logic: INTERSECTION (hints AND quality)")
+        report_lines.append("")
+
+        report_lines.append("OUTPUT FILES:")
+        report_lines.append(f"  {self.output_dir}/genes_confident.txt")
+        report_lines.append(f"  {self.output_dir}/genes_without_hints.txt")
+        report_lines.append(f"  {self.output_dir}/braker_confident_only.gff3")
+        report_lines.append(f"  {self.output_dir}/eggnog_confident_only.emapper.annotations")
+        report_lines.append(f"  {self.output_dir}/interpro_confident_only.tsv")
+        report_lines.append(f"  {self.output_dir}/pipeline_report.txt")
+        if self.run_analysis:
+            report_lines.append(f"  {self.output_dir}/filtered_gff_analysis_report.txt")
+            report_lines.append(f"  {self.output_dir}/filtered_gene_details.csv")
+
+        report_text = "\n".join(report_lines)
+        safe_write_text(report_file, report_text)
+        self.log(f"  ✅ Report: {report_file}")
+
+    # ================================================================
+    # MAIN EXECUTION
+    # ================================================================
+
+    def run(self):
+        self.log("\n" + "=" * 80)
+        self.log("🧬 PIPELINE FILTERING (GUI VERSION) - Cross-Platform")
+        self.log("=" * 80)
+
+        if not self.load_hints_index():
+            return False
+
+        if not self.extract_ids_from_gff():
+            return False
+
+        self.classify_genes()
+        self.save_gene_lists()
+        filtered_gff = self.filter_gff()
+        self.filter_eggnog()
+        self.filter_interproscan()
+
+        # Run integrated analysis if requested
+        if filtered_gff and self.run_analysis:
+            self.analyze_filtered_gff(filtered_gff)
+
+        self.generate_report()
+
+        self.log("\n" + "=" * 80)
+        self.log("✅ PIPELINE COMPLETED SUCCESSFULLY!")
+        self.log(f"📁 Output files in: {self.output_dir}")
+        self.log("=" * 80)
+        return True
+
+
+# ============================================================================
+# GRAPHICAL INTERFACE (Tkinter) WITH SOFT GREEN COLORS
+# ============================================================================
+
+class PipelineGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("hintsFilter GFF")
+        self.root.geometry("800x850")  # Slightly larger for cross-platform
+        self.root.resizable(True, True)
+
+        # --- Color palette (soft green tones) ---
+        self.bg_color = "#F0F8F0"
+        self.fg_color = "#1B5E20"
+        self.frame_bg = "#E8F5E9"
+        self.label_color = "#2E7D32"
+        self.entry_bg = "#FFFFFF"
+        self.btn_bg = "#A5D6A7"
+        self.btn_active = "#81C784"
+        self.btn_fg = "#1B5E20"
+        self.text_bg = "#FFFFFF"
+        self.text_fg = "#1B5E20"
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background=self.frame_bg)
+        style.configure('TLabel', background=self.frame_bg, foreground=self.label_color, font=('Segoe UI', 9))
+        style.configure('TButton', background=self.btn_bg, foreground=self.btn_fg, font=('Segoe UI', 9, 'bold'))
+        style.map('TButton', background=[('active', self.btn_active)])
+        style.configure('TEntry', fieldbackground=self.entry_bg, foreground=self.fg_color)
+
+        # Control variables
+        self.gff_file = tk.StringVar()
+        self.hints_file = tk.StringVar()
+        self.eggnog_file = tk.StringVar()
+        self.interpro_file = tk.StringVar()
+        self.output_dir = tk.StringVar(value="gff_filtered_output")
+
+        self.min_score = tk.DoubleVar(value=0.3)
+        self.margin = tk.IntVar(value=500)
+        self.min_protein_len = tk.IntVar(value=150)
+        self.min_exons = tk.IntVar(value=2)
+        self.min_braker_score = tk.DoubleVar(value=0.3)
+        self.use_abinitio = tk.BooleanVar(value=False)
+        self.run_analysis = tk.BooleanVar(value=True)   # new option, enabled by default
+
+        self.running = False
+
+        self.build_widgets()
+
+    def build_widgets(self):
+        main_frame = ttk.Frame(self.root, style='TFrame')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        title_label = tk.Label(main_frame, text="hintsFilter GFF (for Braker annotation)",
+                               font=('Segoe UI', 14, 'bold'), bg=self.bg_color, fg=self.fg_color)
+        title_label.grid(row=0, column=0, columnspan=4, pady=(0, 15), sticky='w')
+
+        # Platform info
+        platform_info = get_platform_info()
+        platform_label = tk.Label(main_frame, 
+                                 text=f"🖥️ {platform_info['system']} | Python {platform_info['python_version']}",
+                                 font=('Segoe UI', 8), bg=self.bg_color, fg=self.label_color)
+        platform_label.grid(row=0, column=3, pady=(0, 15), sticky='e')
+
+        # Row 1: GFF
+        tk.Label(main_frame, text="Braker prediction file (GFF3/GTF):", font=('Segoe UI', 9), bg=self.bg_color, fg=self.label_color).grid(row=1, column=0, sticky='e', padx=5, pady=5)
+        tk.Entry(main_frame, textvariable=self.gff_file, width=50, bg=self.entry_bg, fg=self.fg_color).grid(row=1, column=1, padx=5, pady=5)
+        tk.Button(main_frame, text="Browse...", bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active, command=self.browse_gff).grid(row=1, column=2, padx=5, pady=5)
+
+        # Row 2: Hints
+        tk.Label(main_frame, text="Hints file (GFF):", font=('Segoe UI', 9), bg=self.bg_color, fg=self.label_color).grid(row=2, column=0, sticky='e', padx=5, pady=5)
+        tk.Entry(main_frame, textvariable=self.hints_file, width=50, bg=self.entry_bg, fg=self.fg_color).grid(row=2, column=1, padx=5, pady=5)
+        tk.Button(main_frame, text="Browse...", bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active, command=self.browse_hints).grid(row=2, column=2, padx=5, pady=5)
+
+        # Row 3: EggNOG
+        tk.Label(main_frame, text="EggNOG file:", font=('Segoe UI', 9), bg=self.bg_color, fg=self.label_color).grid(row=3, column=0, sticky='e', padx=5, pady=5)
+        tk.Entry(main_frame, textvariable=self.eggnog_file, width=50, bg=self.entry_bg, fg=self.fg_color).grid(row=3, column=1, padx=5, pady=5)
+        tk.Button(main_frame, text="Browse...", bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active, command=self.browse_eggnog).grid(row=3, column=2, padx=5, pady=5)
+
+        # Row 4: InterPro
+        tk.Label(main_frame, text="InterProScan file:", font=('Segoe UI', 9), bg=self.bg_color, fg=self.label_color).grid(row=4, column=0, sticky='e', padx=5, pady=5)
+        tk.Entry(main_frame, textvariable=self.interpro_file, width=50, bg=self.entry_bg, fg=self.fg_color).grid(row=4, column=1, padx=5, pady=5)
+        tk.Button(main_frame, text="Browse...", bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active, command=self.browse_interpro).grid(row=4, column=2, padx=5, pady=5)
+
+        # Row 5: Output directory
+        tk.Label(main_frame, text="Output directory:", font=('Segoe UI', 9), bg=self.bg_color, fg=self.label_color).grid(row=5, column=0, sticky='e', padx=5, pady=5)
+        tk.Entry(main_frame, textvariable=self.output_dir, width=50, bg=self.entry_bg, fg=self.fg_color).grid(row=5, column=1, padx=5, pady=5)
+        tk.Button(main_frame, text="Browse...", bg=self.btn_bg, fg=self.btn_fg, activebackground=self.btn_active, command=self.browse_output).grid(row=5, column=2, padx=5, pady=5)
+
+        # --- Parameters panel ---
+        param_frame = tk.LabelFrame(main_frame, text="Filtering Parameters", bg=self.frame_bg, fg=self.fg_color, font=('Segoe UI', 10, 'bold'))
+        param_frame.grid(row=6, column=0, columnspan=4, pady=10, padx=5, sticky='ew')
+
+        # Row 1: Minimum hints score, Margin
+        tk.Label(param_frame, text="Min. hints score:", bg=self.frame_bg, fg=self.label_color).grid(row=0, column=0, padx=5, pady=5, sticky='e')
+        tk.Entry(param_frame, textvariable=self.min_score, width=8, bg=self.entry_bg, fg=self.fg_color).grid(row=0, column=1, padx=5, pady=5, sticky='w')
+
+        tk.Label(param_frame, text="Margin (bp):", bg=self.frame_bg, fg=self.label_color).grid(row=0, column=2, padx=5, pady=5, sticky='e')
+        tk.Entry(param_frame, textvariable=self.margin, width=8, bg=self.entry_bg, fg=self.fg_color).grid(row=0, column=3, padx=5, pady=5, sticky='w')
+
+        # Row 2: Min. protein length, Min. exons, BRAKER score
+        tk.Label(param_frame, text="Min. protein (aa):", bg=self.frame_bg, fg=self.label_color).grid(row=1, column=0, padx=5, pady=5, sticky='e')
+        tk.Entry(param_frame, textvariable=self.min_protein_len, width=8, bg=self.entry_bg, fg=self.fg_color).grid(row=1, column=1, padx=5, pady=5, sticky='w')
+
+        tk.Label(param_frame, text="Min. exons:", bg=self.frame_bg, fg=self.label_color).grid(row=1, column=2, padx=5, pady=5, sticky='e')
+        tk.Entry(param_frame, textvariable=self.min_exons, width=8, bg=self.entry_bg, fg=self.fg_color).grid(row=1, column=3, padx=5, pady=5, sticky='w')
+
+        # BRAKER score field (initially disabled)
+        tk.Label(param_frame, text="BRAKER score ≥:", bg=self.frame_bg, fg=self.label_color).grid(row=1, column=4, padx=5, pady=5, sticky='e')
+        self.braker_score_entry = tk.Entry(param_frame, textvariable=self.min_braker_score, width=8,
+                                           bg=self.entry_bg, fg=self.fg_color, state='disabled')
+        self.braker_score_entry.grid(row=1, column=5, padx=5, pady=5, sticky='w')
+
+        # Row 3: Ab initio mode (Checkbutton with event to enable/disable BRAKER score)
+        self.abinitio_check = tk.Checkbutton(param_frame, text="Ab initio mode (ignore hints)",
+                                             variable=self.use_abinitio,
+                                             bg=self.frame_bg, fg=self.fg_color, selectcolor=self.bg_color,
+                                             font=('Segoe UI', 9),
+                                             command=self.toggle_braker_score)
+        self.abinitio_check.grid(row=2, column=0, columnspan=6, pady=5, sticky='w', padx=10)
+
+        # Row 4: Run GFF analysis (new option)
+        self.analysis_check = tk.Checkbutton(param_frame, text="Run GFF analysis (gene statistics)",
+                                             variable=self.run_analysis,
+                                             bg=self.frame_bg, fg=self.fg_color, selectcolor=self.bg_color,
+                                             font=('Segoe UI', 9))
+        self.analysis_check.grid(row=3, column=0, columnspan=6, pady=5, sticky='w', padx=10)
+
+        # Run button
+        self.run_btn = tk.Button(main_frame, text="▶ RUN PIPELINE", command=self.run_pipeline,
+                                 bg="#66BB6A", fg="white", font=('Segoe UI', 11, 'bold'),
+                                 activebackground="#43A047", activeforeground="white",
+                                 relief=tk.RAISED, bd=3, padx=20, pady=8)
+        self.run_btn.grid(row=7, column=0, columnspan=4, pady=15)
+
+        # Log area
+        log_frame = tk.LabelFrame(main_frame, text="Execution Log", bg=self.frame_bg, fg=self.fg_color, font=('Segoe UI', 10, 'bold'))
+        log_frame.grid(row=8, column=0, columnspan=4, sticky='nsew', padx=5, pady=5)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=18,
+                                                  bg=self.text_bg, fg=self.text_fg,
+                                                  font=('Consolas', 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        main_frame.grid_rowconfigure(8, weight=1)
+        main_frame.grid_columnconfigure(1, weight=1)
+
+    # --- Method to enable/disable the BRAKER score field ---
+    def toggle_braker_score(self):
+        if self.use_abinitio.get():
+            self.braker_score_entry.config(state='normal')
+        else:
+            self.braker_score_entry.config(state='disabled')
+
+    # --- File browser methods ---
+    def browse_gff(self):
+        f = filedialog.askopenfilename(title="Select GFF/GTF file", filetypes=[("GFF/GTF", "*.gff *.gff3 *.gtf"), ("All files", "*.*")])
+        if f: self.gff_file.set(f)
+
+    def browse_hints(self):
+        f = filedialog.askopenfilename(title="Select hints file", filetypes=[("GFF", "*.gff"), ("All files", "*.*")])
+        if f: self.hints_file.set(f)
+
+    def browse_eggnog(self):
+        f = filedialog.askopenfilename(title="Select EggNOG file", filetypes=[("Annotations", "*.annotations"), ("All files", "*.*")])
+        if f: self.eggnog_file.set(f)
+
+    def browse_interpro(self):
+        f = filedialog.askopenfilename(title="Select InterProScan file", filetypes=[("TSV", "*.tsv"), ("All files", "*.*")])
+        if f: self.interpro_file.set(f)
+
+    def browse_output(self):
+        d = filedialog.askdirectory(title="Select output directory")
+        if d: self.output_dir.set(d)
+
+    # --- Log function with proper encoding ---
+    def log_message(self, msg):
+        try:
+            # Normalize message to avoid encoding issues
+            msg = normalize_text(msg)
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
+        except Exception as e:
+            # Fallback: print to console
+            print(f"Log error: {e}")
+            print(msg)
+
+    # --- Execution in a separate thread ---
+    def run_pipeline(self):
+        if self.running:
+            return
+
+        if not self.gff_file.get():
+            messagebox.showerror("Error", "Please select a GFF file.")
+            return
+        if not self.use_abinitio.get() and not self.hints_file.get():
+            messagebox.showerror("Error", "Please select a hints file or enable 'Ab initio mode'.")
+            return
+        if not self.eggnog_file.get() or not self.interpro_file.get():
+            messagebox.showerror("Error", "Please select both EggNOG and InterProScan files.")
+            return
+
+        self.log_text.delete(1.0, tk.END)
+        self.run_btn.config(state=tk.DISABLED, text="⏳ PROCESSING...")
+        self.running = True
+
+        thread = threading.Thread(target=self._run_pipeline_thread, daemon=True)
+        thread.start()
+
+    def _run_pipeline_thread(self):
+        try:
+            # If not ab initio, ignore BRAKER score (pass 0.0)
+            min_braker = self.min_braker_score.get() if self.use_abinitio.get() else 0.0
+
+            pipeline = GFFBasedFilter(
+                gff_file=self.gff_file.get(),
+                hints_file=self.hints_file.get(),
+                eggnog_file=self.eggnog_file.get(),
+                interpro_file=self.interpro_file.get(),
+                output_dir=self.output_dir.get(),
+                min_score=self.min_score.get(),
+                margin=self.margin.get(),
+                min_protein_len=self.min_protein_len.get(),
+                min_exons=self.min_exons.get(),
+                min_braker_score=min_braker,
+                use_abinitio=self.use_abinitio.get(),
+                run_analysis=self.run_analysis.get(),
+                callback_log=self.log_message
+            )
+            success = pipeline.run()
+            if success:
+                self.root.after(0, lambda: messagebox.showinfo("Success", "Pipeline completed successfully!"))
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Error", "Pipeline failed. Check the log."))
+        except Exception as e:
+            self.log_message(f"\n❌ CRITICAL ERROR: {e}")
+            import traceback
+            self.log_message(traceback.format_exc())
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Critical error: {e}"))
+        finally:
+            self.root.after(0, self._finish_run)
+
+    def _finish_run(self):
+        self.run_btn.config(state=tk.NORMAL, text="▶ RUN PIPELINE")
+        self.running = False
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+def main():
+    try:
+        root = tk.Tk()
+        app = PipelineGUI(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Error starting GUI: {e}")
+        import traceback
+        traceback.print_exc()
+        input("Press Enter to exit...")
+
+if __name__ == "__main__":
+    main()
