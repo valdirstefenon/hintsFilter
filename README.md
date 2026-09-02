@@ -70,7 +70,8 @@ If you prefer a virtual environment:
 bash
 python3 -m venv venv
 source venv/bin/activate   # Linux/macOS
-# or venv\Scripts\activate on Windows
+or venv\Scripts\activate on Windows
+
 pip install pandas numpy
 Download the Script
 Save the script as hintsFilter_gui.py (or clone from the GitHub repository).
