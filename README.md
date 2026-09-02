@@ -74,18 +74,18 @@ or venv\Scripts\activate on Windows
 
 pip install pandas numpy
 Download the Script
-Save the script as hintsFilter_gui.py (or clone from the GitHub repository).
+Save the script as hintsFilter.py (or clone from the GitHub repository).
 
 How to Run
 1. Graphical Interface (Recommended)
 Launch the GUI by running:
 bash
-python3 hintsFilter_gui.py
+python3 hintsFilter.py
 The window will appear. Use the Browse buttons to select your files, adjust the parameters, and click RUN PIPELINE. The execution log will show progress and any errors.
 2. Command Line Mode (Advanced)
 The script also supports command line arguments for use in pipelines or headless environments. Run:
 bash
-python3 hintsFilter_gui.py \
+python3 hintsFilter.py \
     -g /path/to/braker.gff3 \
     -x /path/to/hints.gff \
     -e /path/to/eggnog.emapper.annotations \
